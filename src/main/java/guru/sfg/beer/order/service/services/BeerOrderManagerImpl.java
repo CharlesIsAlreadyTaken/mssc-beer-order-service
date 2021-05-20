@@ -16,9 +16,10 @@ import org.springframework.statemachine.support.DefaultStateMachineContext;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.persistence.EntityManager;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -30,7 +31,6 @@ public class BeerOrderManagerImpl implements BeerOrderManager {
     private final StateMachineFactory<BeerOrderStatusEnum, BeerOrderEventEnum> stateMachineFactory;
     private final BeerOrderRepository beerOrderRepository;
     private final BeerOrderStateChangeInterceptor beerOrderStateChangeInterceptor;
-    private final EntityManager entityManager;
 
     @Transactional
     @Override
@@ -50,11 +50,12 @@ public class BeerOrderManagerImpl implements BeerOrderManager {
     public void processValidationResult(UUID beerOrderId, Boolean isValid) {
         Optional<BeerOrder> beerOrderOptional = beerOrderRepository.findById(beerOrderId);
 
-        entityManager.flush();
-
         beerOrderOptional.ifPresentOrElse(beerOrder -> {
             if(isValid){
                 sendBeerOrderEvent(beerOrder, BeerOrderEventEnum.VALIDATION_PASSED);
+
+                awaitForStatus(beerOrderId, BeerOrderStatusEnum.VALIDATED);
+
                 BeerOrder validateOrder = beerOrderRepository.findById(beerOrderId).get();
                 sendBeerOrderEvent(validateOrder, BeerOrderEventEnum.ALLOCATE_ORDER);
             } else {
@@ -81,6 +82,7 @@ public class BeerOrderManagerImpl implements BeerOrderManager {
 
         beerOrderOptional.ifPresentOrElse(beerOrder -> {
             sendBeerOrderEvent(beerOrder, BeerOrderEventEnum.ALLOCATION_SUCCESS);
+            awaitForStatus(beerOrder.getId(), BeerOrderStatusEnum.ALLOCATED);
             updateAllocatedQty(beerOrderDto, beerOrder);
         }, () -> log.error("Order not found. Id: " + beerOrderDto.getId()));
     }
@@ -137,6 +139,36 @@ public class BeerOrderManagerImpl implements BeerOrderManager {
                 .build();
 
         sm.sendEvent(msg);
+    }
+
+    private void awaitForStatus(UUID beerOrderId, BeerOrderStatusEnum statusEnum) {
+        AtomicBoolean found = new AtomicBoolean(false);
+        AtomicInteger loopCount = new AtomicInteger(0);
+
+        while (!found.get()) {
+            if(loopCount.incrementAndGet() > 10){
+                found.set(true);
+                log.debug("Loop retries exceeded");
+            }
+
+            beerOrderRepository.findById(beerOrderId).ifPresentOrElse(beerOrder -> {
+                if(beerOrder.getOrderStatus().equals(statusEnum)){
+                    found.set(true);
+                    log.debug("Order found");
+                } else {
+                    log.debug("Order status not equal. Expected: " + statusEnum.name() + " Found: " + beerOrder.getOrderStatus().name());
+                }
+            }, () -> log.debug("Order Id not found"));
+
+            if(!found.get()){
+                try{
+                    log.debug("Sleeping for retry");
+                    Thread.sleep(100);
+                } catch (Exception e){
+                    //do nothing
+                }
+            }
+        }
     }
 
     @Override
